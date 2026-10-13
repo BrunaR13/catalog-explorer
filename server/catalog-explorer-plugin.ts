@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
   Plugin,
   toPlugin,
@@ -11,6 +13,16 @@ import {
   ResourceType,
   type PluginManifest,
 } from '@databricks/appkit';
+
+/** Raised when a result's external storage links can't be reached from here. */
+class ExternalLinkUnavailable extends Error {}
+
+/**
+ * Process-wide memo: whether EXTERNAL_LINKS result URLs are reachable from this
+ * runtime. `null` = unknown, `true` = usable, `false` = blocked (e.g. the
+ * builder sandbox is denied by the workspace IP access list) → use INLINE.
+ */
+let externalLinksUsable: boolean | null = null;
 
 /**
  * Catalog Explorer plugin.
@@ -256,6 +268,7 @@ class CatalogExplorerPlugin extends Plugin {
 
     try {
       const statementId = resp.statement_id;
+      if (!statementId) throw new Error('Statement id ausente na resposta do warehouse.');
       let state = resp.status?.state;
       const started = Date.now();
       while (state === 'PENDING' || state === 'RUNNING') {
@@ -542,6 +555,7 @@ class CatalogExplorerPlugin extends Plugin {
 
     try {
       const statementId = resp.statement_id;
+      if (!statementId) throw new Error('Statement id ausente na resposta do warehouse.');
       let state = resp.status?.state;
       const started = Date.now();
       while (state === 'PENDING' || state === 'RUNNING') {
@@ -752,6 +766,15 @@ class CatalogExplorerPlugin extends Plugin {
     const job = this.jobs.get(jobId);
     if (!job) return;
 
+    // Preferred path for CSV: EXTERNAL_LINKS — the warehouse writes the result
+    // to cloud storage and we fetch presigned chunk URLs server-side, with no
+    // 25 MiB cap. Falls back to INLINE when those URLs are blocked here.
+    if (format === 'csv' && externalLinksUsable !== false) {
+      const built = await this.buildCsvViaExternalLinks(job, input);
+      if (built) return;
+      job.rowCount = 0; // discard partial progress before the INLINE fallback
+    }
+
     if (format === 'xlsx') {
       const ExcelJS = (await import('exceljs')).default;
       const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ filename: job.filePath });
@@ -806,6 +829,123 @@ class CatalogExplorerPlugin extends Plugin {
 
     job.bytes = fs.statSync(job.filePath).size;
     job.state = 'ready';
+  }
+
+  /**
+   * Build the CSV with EXTERNAL_LINKS: the warehouse materializes the full
+   * result to cloud storage and returns presigned chunk URLs, which we fetch
+   * server-side (no 25 MiB cap). Returns true on success; returns false — and
+   * memoizes it — when the storage URLs are unreachable from this runtime, so
+   * the caller can fall back to the INLINE path. Real SQL errors are thrown.
+   */
+  private async buildCsvViaExternalLinks(job: ExportJob, input: QueryInput): Promise<boolean> {
+    const columns = await this.getColumns(input);
+    const selected = this.resolveSelected(columns, input.columns);
+    const { clause, params } = this.buildWhere(columns, input.filters ?? [], input.search);
+    const qt = qualifiedTable(input.catalog, input.schema, input.table);
+    const selectList = selected.map((c) => quoteIdent(c.name)).join(', ');
+    const statement = `SELECT ${selectList} FROM ${qt} ${clause}`;
+
+    const exec = getExecutionContext().client.statementExecution;
+    const warehouseId = await this.resolveWarehouseId();
+
+    let resp = await exec.executeStatement({
+      warehouse_id: warehouseId,
+      statement,
+      parameters: params.length ? params : undefined,
+      disposition: 'EXTERNAL_LINKS',
+      format: 'CSV',
+      wait_timeout: '50s',
+      on_wait_timeout: 'CONTINUE',
+    });
+
+    const statementId = resp.statement_id;
+    if (!statementId) {
+      throw new Error('Statement id ausente na resposta do warehouse.');
+    }
+
+    try {
+      let state = resp.status?.state;
+      const started = Date.now();
+      while (state === 'PENDING' || state === 'RUNNING') {
+        if (Date.now() - started > 290_000) throw new Error('Query timed out');
+        await new Promise((r) => setTimeout(r, 1000));
+        resp = await exec.getStatement({ statement_id: statementId });
+        state = resp.status?.state;
+      }
+      if (state !== 'SUCCEEDED') {
+        throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
+      }
+    } catch (err) {
+      throw mapScopeError(err);
+    }
+
+    const headerCols = (resp.manifest?.schema?.columns ?? []).map((c) => c.name ?? '');
+    const csvCell = (v: string): string =>
+      /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+
+    const out = fs.createWriteStream(job.filePath);
+    let total = 0;
+
+    const fetchLink = async (link: {
+      external_link?: string;
+      http_headers?: Record<string, string>;
+      row_count?: number;
+    }): Promise<void> => {
+      if (!link.external_link) return;
+      const r = await fetch(link.external_link, {
+        headers: link.http_headers ?? {},
+      }).catch((e: unknown) => {
+        throw new ExternalLinkUnavailable(e instanceof Error ? e.message : String(e));
+      });
+      if (!r.ok || !r.body) {
+        throw new ExternalLinkUnavailable(`external link fetch failed: ${r.status}`);
+      }
+      // Databricks CSV result chunks are headerless; we wrote the header once.
+      await pipeline(Readable.fromWeb(r.body), out, { end: false });
+      total += link.row_count ?? 0;
+      job.rowCount = total;
+    };
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        out.write(
+          '\ufeff' + headerCols.map(csvCell).join(',') + '\r\n',
+          (e) => (e ? reject(e) : resolve()),
+        );
+      });
+
+      const firstLinks = resp.result?.external_links ?? [];
+      for (const l of firstLinks) await fetchLink(l);
+      let last = firstLinks.length ? firstLinks[firstLinks.length - 1] : undefined;
+      while (last && last.next_chunk_index !== undefined && last.next_chunk_index !== null) {
+        const chunk = await exec.getStatementResultChunkN({
+          statement_id: statementId,
+          chunk_index: last.next_chunk_index,
+        });
+        const cl = chunk.external_links ?? [];
+        for (const l of cl) await fetchLink(l);
+        last = cl.length ? cl[cl.length - 1] : undefined;
+      }
+
+      out.end();
+      await once(out, 'finish');
+    } catch (err) {
+      out.destroy();
+      this.safeUnlink(job.filePath);
+      if (err instanceof ExternalLinkUnavailable) {
+        externalLinksUsable = false; // remember: use INLINE from now on
+        return false;
+      }
+      throw err;
+    }
+
+    externalLinksUsable = true;
+    job.rowCount = total;
+    job.truncated = false;
+    job.bytes = fs.statSync(job.filePath).size;
+    job.state = 'ready';
+    return true;
   }
 }
 
