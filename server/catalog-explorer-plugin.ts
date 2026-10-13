@@ -18,11 +18,41 @@ import {
 class ExternalLinkUnavailable extends Error {}
 
 /**
+ * Best-effort statement cancel. The @databricks/sdk-experimental may not
+ * expose a typed cancelStatement method, so we probe known method names
+ * at runtime. If none is found, the statement is left for server-side
+ * timeout — not ideal, but not a blocker.
+ */
+function tryCancelStatement(exec: unknown, statementId: string): void {
+  const svc = exec as Record<string, unknown>;
+  for (const method of ['cancelExecution', 'cancelStatement', 'cancel']) {
+    if (typeof svc[method] === 'function') {
+      (svc[method] as (arg: { statement_id: string }) => Promise<unknown>)
+        .call(exec, { statement_id: statementId })
+        .catch(() => {});
+      return;
+    }
+  }
+}
+
+/**
  * Process-wide memo: whether EXTERNAL_LINKS result URLs are reachable from this
  * runtime. `null` = unknown, `true` = usable, `false` = blocked (e.g. the
  * builder sandbox is denied by the workspace IP access list) → use INLINE.
  */
 let externalLinksUsable: boolean | null = null;
+/** Timestamp when externalLinksUsable was last set to false. */
+let externalLinksFailedAt = 0;
+/** Re-probe external links after this many ms (5 min). */
+const EXTERNAL_LINKS_RETRY_MS = 5 * 60 * 1000;
+
+/** Returns the effective externalLinksUsable, resetting after TTL. */
+function isExternalLinksUsable(): boolean | null {
+  if (externalLinksUsable === false && Date.now() - externalLinksFailedAt > EXTERNAL_LINKS_RETRY_MS) {
+    externalLinksUsable = null; // allow re-probe
+  }
+  return externalLinksUsable;
+}
 
 /**
  * Catalog Explorer plugin.
@@ -823,7 +853,7 @@ class CatalogExplorerPlugin extends Plugin {
     // Preferred path for CSV: EXTERNAL_LINKS — the warehouse writes the result
     // to cloud storage and we fetch presigned chunk URLs server-side, with no
     // 25 MiB cap. Falls back to INLINE when those URLs are blocked here.
-    if (format === 'csv' && externalLinksUsable !== false) {
+    if (format === 'csv' && isExternalLinksUsable() !== false) {
       const built = await this.buildCsvViaExternalLinks(job, input);
       if (built) return;
       job.rowCount = 0; // discard partial progress before the INLINE fallback
@@ -831,7 +861,7 @@ class CatalogExplorerPlugin extends Plugin {
 
     if (format === 'xlsx') {
       // Preferred path: EXTERNAL_LINKS — no 25 MiB cap, streams chunk by chunk.
-      if (externalLinksUsable !== false) {
+      if (isExternalLinksUsable() !== false) {
         const built = await this.buildExcelViaExternalLinks(job, input);
         if (built) return;
         job.rowCount = 0; // discard partial progress before the INLINE fallback
@@ -938,6 +968,7 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
+      tryCancelStatement(exec, statementId);
       throw mapScopeError(err);
     }
 
@@ -995,7 +1026,8 @@ class CatalogExplorerPlugin extends Plugin {
       out.destroy();
       this.safeUnlink(job.filePath);
       if (err instanceof ExternalLinkUnavailable) {
-        externalLinksUsable = false; // remember: use INLINE from now on
+        externalLinksUsable = false;
+        externalLinksFailedAt = Date.now();
         return false;
       }
       throw err;
@@ -1059,6 +1091,7 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
+      tryCancelStatement(exec, statementId);
       throw mapScopeError(err);
     }
 
@@ -1119,6 +1152,7 @@ class CatalogExplorerPlugin extends Plugin {
       this.safeUnlink(job.filePath);
       if (err instanceof ExternalLinkUnavailable) {
         externalLinksUsable = false;
+        externalLinksFailedAt = Date.now();
         return false;
       }
       throw err;
