@@ -155,3 +155,7 @@ appkit.plugins.json              # Manifesto de plugins do AppKit
 - **Frontend**: React, TypeScript, Vite, Tailwind CSS
 - **Componentes de UI**: Radix UI, shadcn/ui
 - **Databricks**: SQL Statement Execution API, Unity Catalog, user authorization (OBO)
+
+## Aviso
+
+> **Este projeto não é um produto oficial da Databricks e não tem suporte da Databricks.** É um exemplo fornecido "como está" (*as is*), sem garantias de qualquer tipo, expressas ou implícitas, nem SLA. Problemas com este código não devem ser abertos como tickets de suporte da Databricks. Revise, teste e valide o código antes de usá-lo em produção; o uso é de responsabilidade de quem o implanta.
