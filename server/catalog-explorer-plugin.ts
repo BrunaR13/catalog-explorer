@@ -23,6 +23,18 @@ class ExternalLinkUnavailable extends Error {}
  * builder sandbox is denied by the workspace IP access list) → use INLINE.
  */
 let externalLinksUsable: boolean | null = null;
+/** Timestamp when externalLinksUsable was last set to false. */
+let externalLinksFailedAt = 0;
+/** Re-probe external links after this many ms (5 min). */
+const EXTERNAL_LINKS_RETRY_MS = 5 * 60 * 1000;
+
+/** Returns the effective externalLinksUsable, resetting after TTL. */
+function isExternalLinksUsable(): boolean | null {
+  if (externalLinksUsable === false && Date.now() - externalLinksFailedAt > EXTERNAL_LINKS_RETRY_MS) {
+    externalLinksUsable = null; // allow re-probe
+  }
+  return externalLinksUsable;
+}
 
 /**
  * Catalog Explorer plugin.
@@ -130,6 +142,60 @@ function qualifiedTable(catalog: string, schema: string, table: string): string 
 /** Escape LIKE wildcards so the user value is matched literally. */
 function escapeLike(value: string): string {
   return value.replace(/([\\%_])/g, '\\$1');
+}
+
+/**
+ * Parse a CSV text chunk (no header row) into an array of string arrays.
+ * Handles RFC 4180 quoting: double-quote delimited fields with internal
+ * double-quotes escaped as "".
+ */
+function parseCsvChunk(text: string): string[][] {
+  const rows: string[][] = [];
+  const len = text.length;
+  let i = 0;
+  while (i < len) {
+    const row: string[] = [];
+    for (;;) {
+      if (i >= len) {
+        row.push('');
+        break;
+      }
+      let field: string;
+      if (text[i] === '"') {
+        i++; // skip opening quote
+        let parts = '';
+        while (i < len) {
+          if (text[i] === '"') {
+            if (i + 1 < len && text[i + 1] === '"') {
+              parts += '"';
+              i += 2;
+            } else {
+              i++; // skip closing quote
+              break;
+            }
+          } else {
+            parts += text[i];
+            i++;
+          }
+        }
+        field = parts;
+      } else {
+        const start = i;
+        while (i < len && text[i] !== ',' && text[i] !== '\n' && text[i] !== '\r') i++;
+        field = text.substring(start, i);
+      }
+      row.push(field);
+      if (i < len && text[i] === ',') {
+        i++;
+        continue;
+      }
+      break;
+    }
+    if (i < len && text[i] === '\r') i++;
+    if (i < len && text[i] === '\n') i++;
+    if (row.length > 1 || (row.length === 1 && row[0] !== '')) rows.push(row);
+  }
+  return rows;
 }
 
 function isComplex(col: ExplorerColumn): boolean {
@@ -769,13 +835,20 @@ class CatalogExplorerPlugin extends Plugin {
     // Preferred path for CSV: EXTERNAL_LINKS — the warehouse writes the result
     // to cloud storage and we fetch presigned chunk URLs server-side, with no
     // 25 MiB cap. Falls back to INLINE when those URLs are blocked here.
-    if (format === 'csv' && externalLinksUsable !== false) {
+    if (format === 'csv' && isExternalLinksUsable() !== false) {
       const built = await this.buildCsvViaExternalLinks(job, input);
       if (built) return;
       job.rowCount = 0; // discard partial progress before the INLINE fallback
     }
 
     if (format === 'xlsx') {
+      // Preferred path: EXTERNAL_LINKS — no 25 MiB cap, streams chunk by chunk.
+      if (isExternalLinksUsable() !== false) {
+        const built = await this.buildExcelViaExternalLinks(job, input);
+        if (built) return;
+        job.rowCount = 0; // discard partial progress before the INLINE fallback
+      }
+
       const ExcelJS = (await import('exceljs')).default;
       const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ filename: job.filePath });
       const sheet = workbook.addWorksheet('data');
@@ -877,6 +950,7 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
+      exec.cancelStatement({ statement_id: statementId }).catch(() => {});
       throw mapScopeError(err);
     }
 
@@ -934,7 +1008,8 @@ class CatalogExplorerPlugin extends Plugin {
       out.destroy();
       this.safeUnlink(job.filePath);
       if (err instanceof ExternalLinkUnavailable) {
-        externalLinksUsable = false; // remember: use INLINE from now on
+        externalLinksUsable = false;
+        externalLinksFailedAt = Date.now();
         return false;
       }
       throw err;
@@ -943,6 +1018,131 @@ class CatalogExplorerPlugin extends Plugin {
     externalLinksUsable = true;
     job.rowCount = total;
     job.truncated = false;
+    job.bytes = fs.statSync(job.filePath).size;
+    job.state = 'ready';
+    return true;
+  }
+
+  /**
+   * Build the Excel file via EXTERNAL_LINKS: the warehouse writes the full
+   * result to cloud storage as CSV and we fetch the presigned chunk URLs
+   * server-side. Each CSV chunk is parsed with parseCsvChunk and streamed
+   * into an ExcelJS workbook writer, so there is no 25 MiB ceiling and
+   * memory stays flat. Returns true on success; false when external URLs
+   * are unreachable, so the caller can fall back to the INLINE path.
+   */
+  private async buildExcelViaExternalLinks(
+    job: ExportJob,
+    input: QueryInput,
+  ): Promise<boolean> {
+    const columns = await this.getColumns(input);
+    const selected = this.resolveSelected(columns, input.columns);
+    const { clause, params } = this.buildWhere(columns, input.filters ?? [], input.search);
+    const qt = qualifiedTable(input.catalog, input.schema, input.table);
+    const selectList = selected.map((c) => quoteIdent(c.name)).join(', ');
+    const statement = `SELECT ${selectList} FROM ${qt} ${clause} LIMIT ${EXCEL_MAX_DATA_ROWS}`;
+
+    const exec = getExecutionContext().client.statementExecution;
+    const warehouseId = await this.resolveWarehouseId();
+
+    let resp = await exec.executeStatement({
+      warehouse_id: warehouseId,
+      statement,
+      parameters: params.length ? params : undefined,
+      disposition: 'EXTERNAL_LINKS',
+      format: 'CSV',
+      wait_timeout: '50s',
+      on_wait_timeout: 'CONTINUE',
+    });
+
+    const statementId = resp.statement_id;
+    if (!statementId) {
+      throw new Error('Statement id ausente na resposta do warehouse.');
+    }
+
+    try {
+      let state = resp.status?.state;
+      const started = Date.now();
+      while (state === 'PENDING' || state === 'RUNNING') {
+        if (Date.now() - started > 290_000) throw new Error('Query timed out');
+        await new Promise((r) => setTimeout(r, 1000));
+        resp = await exec.getStatement({ statement_id: statementId });
+        state = resp.status?.state;
+      }
+      if (state !== 'SUCCEEDED') {
+        throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
+      }
+    } catch (err) {
+      exec.cancelStatement({ statement_id: statementId }).catch(() => {});
+      throw mapScopeError(err);
+    }
+
+    const headerCols = (resp.manifest?.schema?.columns ?? []).map((c) => c.name ?? '');
+
+    const ExcelJS = (await import('exceljs')).default;
+    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ filename: job.filePath });
+    const sheet = workbook.addWorksheet('data');
+    let total = 0;
+
+    const fetchAndWriteLink = async (link: {
+      external_link?: string;
+      http_headers?: Record<string, string>;
+      row_count?: number;
+    }): Promise<void> => {
+      if (!link.external_link) return;
+      const r = await fetch(link.external_link, {
+        headers: link.http_headers ?? {},
+      }).catch((e: unknown) => {
+        throw new ExternalLinkUnavailable(e instanceof Error ? e.message : String(e));
+      });
+      if (!r.ok || !r.body) {
+        throw new ExternalLinkUnavailable(`external link fetch failed: ${r.status}`);
+      }
+      const csvText = await r.text();
+      const parsed = parseCsvChunk(csvText);
+      for (const row of parsed) {
+        sheet.addRow(row.map((v) => (v === null ? '' : v))).commit();
+      }
+      total += parsed.length;
+      job.rowCount = total;
+    };
+
+    try {
+      // Write the header row once.
+      sheet.addRow(headerCols).commit();
+
+      const firstLinks = resp.result?.external_links ?? [];
+      for (const l of firstLinks) await fetchAndWriteLink(l);
+      let last = firstLinks.length ? firstLinks[firstLinks.length - 1] : undefined;
+      while (last && last.next_chunk_index !== undefined && last.next_chunk_index !== null) {
+        const chunk = await exec.getStatementResultChunkN({
+          statement_id: statementId,
+          chunk_index: last.next_chunk_index,
+        });
+        const cl = chunk.external_links ?? [];
+        for (const l of cl) await fetchAndWriteLink(l);
+        last = cl.length ? cl[cl.length - 1] : undefined;
+      }
+
+      await workbook.commit();
+    } catch (err) {
+      try {
+        await workbook.commit();
+      } catch {
+        /* best effort close */
+      }
+      this.safeUnlink(job.filePath);
+      if (err instanceof ExternalLinkUnavailable) {
+        externalLinksUsable = false;
+        externalLinksFailedAt = Date.now();
+        return false;
+      }
+      throw err;
+    }
+
+    externalLinksUsable = true;
+    job.rowCount = total;
+    job.truncated = total >= EXCEL_MAX_DATA_ROWS;
     job.bytes = fs.statSync(job.filePath).size;
     job.state = 'ready';
     return true;
