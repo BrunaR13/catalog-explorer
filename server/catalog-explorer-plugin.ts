@@ -48,6 +48,28 @@ interface ExportJob {
   createdAt: number;
 }
 
+const SCOPE_ERROR_MESSAGE =
+  'A permissão de SQL do app (escopo "sql:restricted-query") não permite ler resultados ' +
+  'grandes ou consultas demoradas do warehouse: ela bloqueia as chamadas GET usadas para ' +
+  'paginar o resultado e para aguardar consultas longas. A prévia e a contagem funcionam, ' +
+  'mas, para exportar grandes volumes, um administrador precisa conceder ao app um escopo ' +
+  'de SQL mais amplo no App Space UI — ou reduza os filtros para um resultado menor.';
+
+function isScopeError(message: string): boolean {
+  return (
+    /cannot send a (GET|POST|PUT|DELETE) request to this endpoint/i.test(message) ||
+    /scope\(s\) \[sql:restricted-query\]/i.test(message)
+  );
+}
+
+/** Translate the opaque OBO scope rejection into an actionable message. */
+function mapScopeError(err: unknown): Error {
+  if (err instanceof Error) {
+    return isScopeError(err.message) ? new Error(SCOPE_ERROR_MESSAGE) : err;
+  }
+  return new Error(String(err));
+}
+
 export interface ExplorerColumn {
   name: string;
   typeName: string;
@@ -228,45 +250,49 @@ class CatalogExplorerPlugin extends Plugin {
       parameters: parameters.length ? parameters : undefined,
       disposition: 'INLINE',
       format: 'JSON_ARRAY',
-      wait_timeout: '30s',
+      wait_timeout: '50s',
       on_wait_timeout: 'CONTINUE',
     });
 
-    const statementId = resp.statement_id;
-    let state = resp.status?.state;
-    const started = Date.now();
-    while (state === 'PENDING' || state === 'RUNNING') {
-      if (Date.now() - started > 290_000) {
-        throw new Error('Query timed out');
+    try {
+      const statementId = resp.statement_id;
+      let state = resp.status?.state;
+      const started = Date.now();
+      while (state === 'PENDING' || state === 'RUNNING') {
+        if (Date.now() - started > 290_000) {
+          throw new Error('Query timed out');
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+        resp = await exec.getStatement({ statement_id: statementId });
+        state = resp.status?.state;
       }
-      await new Promise((r) => setTimeout(r, 1000));
-      resp = await exec.getStatement({ statement_id: statementId });
-      state = resp.status?.state;
+
+      if (state !== 'SUCCEEDED') {
+        const msg = resp.status?.error?.message || `Query ${state ?? 'failed'}`;
+        throw new Error(msg);
+      }
+
+      const columns: ExplorerColumn[] = (resp.manifest?.schema?.columns ?? []).map((c) => ({
+        name: c.name ?? '',
+        typeName: String(c.type_name ?? ''),
+        typeText: c.type_text ?? '',
+      }));
+
+      let rows: string[][] = resp.result?.data_array ?? [];
+      let next = resp.result?.next_chunk_index;
+      while (next !== undefined && next !== null) {
+        const chunk = await exec.getStatementResultChunkN({
+          statement_id: statementId,
+          chunk_index: next,
+        });
+        rows = rows.concat(chunk.data_array ?? []);
+        next = chunk.next_chunk_index;
+      }
+
+      return { columns, rows };
+    } catch (err) {
+      throw mapScopeError(err);
     }
-
-    if (state !== 'SUCCEEDED') {
-      const msg = resp.status?.error?.message || `Query ${state ?? 'failed'}`;
-      throw new Error(msg);
-    }
-
-    const columns: ExplorerColumn[] = (resp.manifest?.schema?.columns ?? []).map((c) => ({
-      name: c.name ?? '',
-      typeName: String(c.type_name ?? ''),
-      typeText: c.type_text ?? '',
-    }));
-
-    let rows: string[][] = resp.result?.data_array ?? [];
-    let next = resp.result?.next_chunk_index;
-    while (next !== undefined && next !== null) {
-      const chunk = await exec.getStatementResultChunkN({
-        statement_id: statementId,
-        chunk_index: next,
-      });
-      rows = rows.concat(chunk.data_array ?? []);
-      next = chunk.next_chunk_index;
-    }
-
-    return { columns, rows };
   }
 
   // ---- browsing ------------------------------------------------------------
@@ -497,51 +523,55 @@ class CatalogExplorerPlugin extends Plugin {
         parameters: parameters.length ? parameters : undefined,
         disposition: 'INLINE',
         format: 'JSON_ARRAY',
-        wait_timeout: '30s',
+        wait_timeout: '50s',
         on_wait_timeout: 'CONTINUE',
       });
     } catch (err) {
       if (err instanceof Error && isOverflow(err.message)) return { ok: false };
-      throw err;
+      throw mapScopeError(err);
     }
 
-    const statementId = resp.statement_id;
-    let state = resp.status?.state;
-    const started = Date.now();
-    while (state === 'PENDING' || state === 'RUNNING') {
-      if (Date.now() - started > 290_000) throw new Error('Query timed out');
-      await new Promise((r) => setTimeout(r, 1000));
-      resp = await exec.getStatement({ statement_id: statementId });
-      state = resp.status?.state;
-    }
-
-    if (state !== 'SUCCEEDED') {
-      const msg = resp.status?.error?.message || `Query ${state ?? 'failed'}`;
-      if (isOverflow(msg)) return { ok: false };
-      throw new Error(msg);
-    }
-
-    let total = 0;
-    const first = resp.result?.data_array ?? [];
-    if (first.length) {
-      await onRows(first);
-      total += first.length;
-    }
-    let next = resp.result?.next_chunk_index;
-    while (next !== undefined && next !== null) {
-      const chunk = await exec.getStatementResultChunkN({
-        statement_id: statementId,
-        chunk_index: next,
-      });
-      const data = chunk.data_array ?? [];
-      if (data.length) {
-        await onRows(data);
-        total += data.length;
+    try {
+      const statementId = resp.statement_id;
+      let state = resp.status?.state;
+      const started = Date.now();
+      while (state === 'PENDING' || state === 'RUNNING') {
+        if (Date.now() - started > 290_000) throw new Error('Query timed out');
+        await new Promise((r) => setTimeout(r, 1000));
+        resp = await exec.getStatement({ statement_id: statementId });
+        state = resp.status?.state;
       }
-      next = chunk.next_chunk_index;
-    }
 
-    return { ok: true, rowCount: total };
+      if (state !== 'SUCCEEDED') {
+        const msg = resp.status?.error?.message || `Query ${state ?? 'failed'}`;
+        if (isOverflow(msg)) return { ok: false };
+        throw new Error(msg);
+      }
+
+      let total = 0;
+      const first = resp.result?.data_array ?? [];
+      if (first.length) {
+        await onRows(first);
+        total += first.length;
+      }
+      let next = resp.result?.next_chunk_index;
+      while (next !== undefined && next !== null) {
+        const chunk = await exec.getStatementResultChunkN({
+          statement_id: statementId,
+          chunk_index: next,
+        });
+        const data = chunk.data_array ?? [];
+        if (data.length) {
+          await onRows(data);
+          total += data.length;
+        }
+        next = chunk.next_chunk_index;
+      }
+
+      return { ok: true, rowCount: total };
+    } catch (err) {
+      throw mapScopeError(err);
+    }
   }
 
   // ---- routes --------------------------------------------------------------
