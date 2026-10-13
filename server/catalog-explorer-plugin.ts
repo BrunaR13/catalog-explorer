@@ -950,7 +950,6 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
-      exec.cancelStatement({ statement_id: statementId }).catch(() => {});
       throw mapScopeError(err);
     }
 
@@ -1073,7 +1072,6 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
-      exec.cancelStatement({ statement_id: statementId }).catch(() => {});
       throw mapScopeError(err);
     }
 
