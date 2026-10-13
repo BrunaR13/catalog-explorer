@@ -346,29 +346,36 @@ class CatalogExplorerPlugin extends Plugin {
 
     const selectList = selected.map((c) => quoteIdent(c.name)).join(', ');
     const scalarCols = columns.filter((c) => !isComplex(c));
-    const canPaginate = scalarCols.length > 0;
-    const orderBy = canPaginate
-      ? `ORDER BY ${scalarCols.map((c) => quoteIdent(c.name)).join(', ')}`
-      : '';
 
     await handlers.onStart(selected.map((c) => c.name));
 
-    let total = 0;
-    let truncated = false;
+    const bounded = maxRows < Number.MAX_SAFE_INTEGER;
+    const limitClause = bounded ? `LIMIT ${maxRows}` : '';
 
-    if (!canPaginate) {
-      // No orderable column — a single INLINE statement (bounded by 25 MiB).
-      const stmt = `SELECT ${selectList} FROM ${qt} ${clause} LIMIT ${Math.min(
-        maxRows,
-        1_000_000,
-      )}`;
-      const { rows } = await this.runStatement(stmt, params);
-      await handlers.onRows(rows);
-      total = rows.length;
-      truncated = total >= maxRows;
-      return { rowCount: total, truncated };
+    // Fast path: one statement, streamed chunk by chunk, with no ORDER BY so
+    // the warehouse scans once without sorting. This handles everything that
+    // fits in the 25 MiB INLINE ceiling — the common case — as a single query.
+    const fast = await this.streamSingle(
+      `SELECT ${selectList} FROM ${qt} ${clause} ${limitClause}`,
+      params,
+      handlers.onRows,
+    );
+    if (fast.ok) {
+      return { rowCount: fast.rowCount, truncated: bounded && fast.rowCount >= maxRows };
     }
 
+    // Fallback (result exceeds the INLINE ceiling): page through the result.
+    // A stable ORDER BY over every scalar column keeps pages consistent across
+    // separate statements; without an orderable column we cannot paginate.
+    if (scalarCols.length === 0) {
+      throw new Error(
+        'O resultado é grande demais para exportar e a tabela não tem colunas ordenáveis para paginar. Refine os filtros.',
+      );
+    }
+    const orderBy = `ORDER BY ${scalarCols.map((c) => quoteIdent(c.name)).join(', ')}`;
+
+    let total = 0;
+    let truncated = false;
     let pageSize = DEFAULT_PAGE_SIZE;
     let offset = 0;
 
@@ -402,6 +409,77 @@ class CatalogExplorerPlugin extends Plugin {
     }
 
     return { rowCount: total, truncated };
+  }
+
+  /**
+   * Execute one statement and stream each INLINE result chunk to `onRows` as it
+   * arrives (no buffering of the whole result). Returns `{ ok: false }` when the
+   * result overflows the 25 MiB INLINE ceiling, so the caller can fall back to
+   * paginated fetching; any other failure is thrown.
+   */
+  private async streamSingle(
+    statement: string,
+    parameters: SqlParam[],
+    onRows: (rows: string[][]) => Promise<void> | void,
+  ): Promise<{ ok: true; rowCount: number } | { ok: false }> {
+    const client = getExecutionContext().client;
+    const warehouseId = await this.resolveWarehouseId();
+    const exec = client.statementExecution;
+    const isOverflow = (msg: string) => /inline byte limit/i.test(msg);
+
+    let resp: Awaited<ReturnType<typeof exec.executeStatement>>;
+    try {
+      resp = await exec.executeStatement({
+        warehouse_id: warehouseId,
+        statement,
+        parameters: parameters.length ? parameters : undefined,
+        disposition: 'INLINE',
+        format: 'JSON_ARRAY',
+        wait_timeout: '30s',
+        on_wait_timeout: 'CONTINUE',
+      });
+    } catch (err) {
+      if (err instanceof Error && isOverflow(err.message)) return { ok: false };
+      throw err;
+    }
+
+    const statementId = resp.statement_id;
+    let state = resp.status?.state;
+    const started = Date.now();
+    while (state === 'PENDING' || state === 'RUNNING') {
+      if (Date.now() - started > 290_000) throw new Error('Query timed out');
+      await new Promise((r) => setTimeout(r, 1000));
+      resp = await exec.getStatement({ statement_id: statementId });
+      state = resp.status?.state;
+    }
+
+    if (state !== 'SUCCEEDED') {
+      const msg = resp.status?.error?.message || `Query ${state ?? 'failed'}`;
+      if (isOverflow(msg)) return { ok: false };
+      throw new Error(msg);
+    }
+
+    let total = 0;
+    const first = resp.result?.data_array ?? [];
+    if (first.length) {
+      await onRows(first);
+      total += first.length;
+    }
+    let next = resp.result?.next_chunk_index;
+    while (next !== undefined && next !== null) {
+      const chunk = await exec.getStatementResultChunkN({
+        statement_id: statementId,
+        chunk_index: next,
+      });
+      const data = chunk.data_array ?? [];
+      if (data.length) {
+        await onRows(data);
+        total += data.length;
+      }
+      next = chunk.next_chunk_index;
+    }
+
+    return { ok: true, rowCount: total };
   }
 
   // ---- routes --------------------------------------------------------------
