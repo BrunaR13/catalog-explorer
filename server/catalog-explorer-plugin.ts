@@ -481,9 +481,18 @@ class CatalogExplorerPlugin extends Plugin {
         rows = (await this.runStatement(stmt, params)).rows;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/inline byte limit/i.test(msg) && pageSize > MIN_PAGE_SIZE) {
-          pageSize = Math.max(MIN_PAGE_SIZE, Math.floor(pageSize / 2));
-          continue; // retry same offset with a smaller page
+        if (/inline byte limit/i.test(msg)) {
+          if (pageSize > MIN_PAGE_SIZE) {
+            pageSize = Math.max(MIN_PAGE_SIZE, Math.floor(pageSize / 2));
+            continue; // retry same offset with a smaller page
+          }
+          throw new Error(
+            'O resultado é grande demais para exportar neste ambiente: o limite é de ' +
+              '25 MiB por requisição e algumas linhas desta tabela chegam a centenas de KB. ' +
+              'Para exportar, reduza o volume — aplique filtros para diminuir o número de ' +
+              'linhas e/ou desmarque colunas grandes (textos longos ou colunas de lista/array) ' +
+              'no seletor de colunas — e tente novamente.',
+          );
         }
         throw err;
       }
