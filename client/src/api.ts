@@ -47,13 +47,6 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return data as T;
 }
 
-function toBase64Utf8(str: string): string {
-  const bytes = new TextEncoder().encode(str);
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary);
-}
-
 export const api = {
   catalogs: () =>
     getJson<{ catalogs: string[] }>(`${BASE}/catalogs`).then((d) => d.catalogs),
@@ -70,9 +63,30 @@ export const api = {
     postJson<{ count: number }>(`${BASE}/count`, body).then((d) => d.count),
 };
 
-export function exportUrl(format: 'csv' | 'xlsx', body: QueryBody): string {
-  const payload = toBase64Utf8(JSON.stringify(body));
-  return `${BASE}/export?format=${format}&payload=${encodeURIComponent(payload)}`;
+export interface ExportStatus {
+  state: 'building' | 'ready' | 'error';
+  rowCount: number;
+  truncated: boolean;
+  bytes: number;
+  error?: string;
+}
+
+/** Kick off a server-side export build; returns the job id. */
+export async function startExport(
+  format: 'csv' | 'xlsx',
+  body: QueryBody,
+): Promise<string> {
+  const data = await postJson<{ id: string }>(`${BASE}/export/start`, { ...body, format });
+  return data.id;
+}
+
+export function exportStatus(id: string): Promise<ExportStatus> {
+  return getJson<ExportStatus>(`${BASE}/export/${id}/status`);
+}
+
+/** Resumable download URL for a finished export job. */
+export function exportFileUrl(id: string): string {
+  return `${BASE}/export/${id}/file`;
 }
 
 export interface OperatorDef {

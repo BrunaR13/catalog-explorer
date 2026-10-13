@@ -1,4 +1,9 @@
 import express from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import {
   Plugin,
   toPlugin,
@@ -25,6 +30,23 @@ const EXCEL_MAX_DATA_ROWS = 1_048_575; // 1,048,576 incl. header row.
 const PREVIEW_LIMIT = 100;
 const DEFAULT_PAGE_SIZE = 25_000;
 const MIN_PAGE_SIZE = 500;
+const JOB_TTL_MS = 60 * 60 * 1000; // keep built export files for 1 hour
+
+type ExportFormat = 'csv' | 'xlsx';
+
+interface ExportJob {
+  id: string;
+  owner: string;
+  format: ExportFormat;
+  baseName: string;
+  filePath: string;
+  state: 'building' | 'ready' | 'error';
+  rowCount: number;
+  truncated: boolean;
+  bytes: number;
+  error?: string;
+  createdAt: number;
+}
 
 export interface ExplorerColumn {
   name: string;
@@ -138,6 +160,46 @@ const manifest = {
 
 class CatalogExplorerPlugin extends Plugin {
   static manifest = manifest;
+
+  /** In-memory registry of export jobs, keyed by job id. */
+  private jobs = new Map<string, ExportJob>();
+  private cleanupTimer?: ReturnType<typeof setInterval>;
+
+  async setup(): Promise<void> {
+    this.cleanupTimer = setInterval(() => this.sweepJobs(), 10 * 60 * 1000);
+    this.cleanupTimer.unref?.();
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    for (const job of this.jobs.values()) this.safeUnlink(job.filePath);
+    this.jobs.clear();
+  }
+
+  private sweepJobs(): void {
+    const now = Date.now();
+    for (const [id, job] of this.jobs) {
+      if (now - job.createdAt > JOB_TTL_MS) {
+        this.safeUnlink(job.filePath);
+        this.jobs.delete(id);
+      }
+    }
+  }
+
+  private safeUnlink(p: string): void {
+    try {
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch {
+      /* best effort */
+    }
+  }
+
+  private ownsJob(req: express.Request, job: ExportJob): boolean {
+    const user = String(req.headers['x-forwarded-user'] ?? '');
+    // When identity headers are absent (local dev) ownership is not enforced.
+    if (!job.owner || !user) return true;
+    return job.owner === user;
+  }
 
   // ---- low level execution -------------------------------------------------
 
@@ -521,8 +583,74 @@ class CatalogExplorerPlugin extends Plugin {
       void this.handle(res, () => this.asUser(req).count(input).then((count) => ({ count })));
     });
 
-    router.get('/export', (req, res) => {
-      void this.handleExport(req, res);
+    // Start an export: builds the file server-side, returns a job id. The
+    // build keeps running in the user's OBO context even after this handler
+    // responds (AsyncLocalStorage follows the async chain).
+    router.post('/export/start', asJson, (req, res) => {
+      const input = this.parseQueryInput(req.body);
+      if (!input) return void res.status(400).json({ error: 'Invalid request' });
+      const body = req.body as { format?: unknown };
+      const format: ExportFormat = body.format === 'xlsx' ? 'xlsx' : 'csv';
+      const id = randomUUID();
+      const baseName = `${input.catalog}.${input.schema}.${input.table}`.replace(
+        /[^A-Za-z0-9._-]/g,
+        '_',
+      );
+      const job: ExportJob = {
+        id,
+        owner: String(req.headers['x-forwarded-user'] ?? ''),
+        format,
+        baseName,
+        filePath: path.join(os.tmpdir(), `catalog-export-${id}.${format}`),
+        state: 'building',
+        rowCount: 0,
+        truncated: false,
+        bytes: 0,
+        createdAt: Date.now(),
+      };
+      this.jobs.set(id, job);
+      const maxRows = format === 'xlsx' ? EXCEL_MAX_DATA_ROWS : Number.MAX_SAFE_INTEGER;
+      void this.asUser(req)
+        .buildExport(id, input, format, maxRows)
+        .catch((err: unknown) => {
+          job.state = 'error';
+          job.error = err instanceof Error ? err.message : 'Falha na exportação';
+          this.safeUnlink(job.filePath);
+        });
+      res.json({ id });
+    });
+
+    router.get('/export/:id/status', (req, res) => {
+      const job = this.jobs.get(req.params.id);
+      if (!job) return void res.status(404).json({ error: 'Export não encontrado' });
+      if (!this.ownsJob(req, job))
+        return void res.status(403).json({ error: 'Sem acesso a este export' });
+      res.json({
+        state: job.state,
+        rowCount: job.rowCount,
+        truncated: job.truncated,
+        bytes: job.bytes,
+        error: job.error,
+      });
+    });
+
+    // Resumable download: res.download → sendFile, which honors HTTP Range
+    // requests plus ETag/Last-Modified, so an interrupted transfer can resume
+    // from where it stopped instead of restarting the whole export.
+    router.get('/export/:id/file', (req, res) => {
+      const job = this.jobs.get(req.params.id);
+      if (!job) return void res.status(404).json({ error: 'Export não encontrado' });
+      if (!this.ownsJob(req, job))
+        return void res.status(403).json({ error: 'Sem acesso a este export' });
+      if (job.state !== 'ready')
+        return void res.status(409).json({ error: 'Export ainda não está pronto' });
+      const contentType =
+        job.format === 'xlsx'
+          ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          : 'text/csv; charset=utf-8';
+      res.download(job.filePath, `${job.baseName}.${job.format}`, {
+        headers: { 'Content-Type': contentType },
+      });
     });
   }
 
@@ -571,98 +699,74 @@ class CatalogExplorerPlugin extends Plugin {
     }
   }
 
-  private async handleExport(req: express.Request, res: express.Response): Promise<void> {
-    const format = String(req.query.format ?? 'csv').toLowerCase();
-    let input: QueryInput | null = null;
-    try {
-      const raw = Buffer.from(String(req.query.payload ?? ''), 'base64').toString('utf-8');
-      input = this.parseQueryInput(JSON.parse(raw));
-    } catch {
-      input = null;
-    }
-    if (!input) return void res.status(400).json({ error: 'Invalid payload' });
-
-    const baseName = `${input.catalog}.${input.schema}.${input.table}`.replace(
-      /[^A-Za-z0-9._-]/g,
-      '_',
-    );
-
-    try {
-      if (format === 'xlsx') {
-        await this.exportXlsx(req, res, input, baseName);
-      } else {
-        await this.exportCsv(req, res, input, baseName);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Export failed';
-      if (!res.headersSent) {
-        res.status(500).json({ error: message });
-      } else {
-        res.end();
-      }
-    }
-  }
-
-  private async exportCsv(
-    req: express.Request,
-    res: express.Response,
+  /**
+   * Build an export file on disk (runs inside the user's OBO context). Writes
+   * are streamed to disk so memory stays flat regardless of result size, and
+   * `job.rowCount` is updated as rows land so the client can show progress.
+   */
+  async buildExport(
+    jobId: string,
     input: QueryInput,
-    baseName: string,
+    format: ExportFormat,
+    maxRows: number,
   ): Promise<void> {
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${baseName}.csv"`);
-    res.write('\ufeff'); // UTF-8 BOM for Excel compatibility.
+    const job = this.jobs.get(jobId);
+    if (!job) return;
 
-    const csvCell = (v: string | null): string => {
-      if (v === null || v === undefined) return '';
-      const needsQuote = /[",\n\r]/.test(v);
-      const escaped = v.replace(/"/g, '""');
-      return needsQuote ? `"${escaped}"` : escaped;
-    };
+    if (format === 'xlsx') {
+      const ExcelJS = (await import('exceljs')).default;
+      const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ filename: job.filePath });
+      const sheet = workbook.addWorksheet('data');
+      const result = await this.exportRows(input, maxRows, {
+        onStart: (headers) => {
+          sheet.addRow(headers).commit();
+        },
+        onRows: (rows) => {
+          for (const row of rows) {
+            sheet.addRow(row.map((v) => (v === null ? '' : v))).commit();
+          }
+          job.rowCount += rows.length;
+        },
+      });
+      await workbook.commit();
+      job.rowCount = result.rowCount;
+      job.truncated = result.truncated;
+    } else {
+      const out = fs.createWriteStream(job.filePath);
+      let streamErr: Error | null = null;
+      out.on('error', (e) => {
+        streamErr = e;
+      });
+      const write = async (s: string): Promise<void> => {
+        if (streamErr) throw streamErr;
+        if (!out.write(s)) await once(out, 'drain');
+      };
+      const csvCell = (v: string | null): string => {
+        if (v === null || v === undefined) return '';
+        const needsQuote = /[",\n\r]/.test(v);
+        return needsQuote ? `"${v.replace(/"/g, '""')}"` : v;
+      };
 
-    await this.asUser(req).exportRows(input, Number.MAX_SAFE_INTEGER, {
-      onStart: (headers) => {
-        res.write(headers.map(csvCell).join(',') + '\r\n');
-      },
-      onRows: (rows) => {
-        let buf = '';
-        for (const row of rows) {
-          buf += row.map(csvCell).join(',') + '\r\n';
-        }
-        res.write(buf);
-      },
-    });
-    res.end();
-  }
+      await write('\ufeff'); // UTF-8 BOM for Excel compatibility.
+      const result = await this.exportRows(input, maxRows, {
+        onStart: async (headers) => {
+          await write(headers.map(csvCell).join(',') + '\r\n');
+        },
+        onRows: async (rows) => {
+          let buf = '';
+          for (const row of rows) buf += row.map(csvCell).join(',') + '\r\n';
+          await write(buf);
+          job.rowCount += rows.length;
+        },
+      });
+      out.end();
+      await once(out, 'finish');
+      job.rowCount = result.rowCount;
+      job.truncated = result.truncated;
+    }
 
-  private async exportXlsx(
-    req: express.Request,
-    res: express.Response,
-    input: QueryInput,
-    baseName: string,
-  ): Promise<void> {
-    const ExcelJS = (await import('exceljs')).default;
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    );
-    res.setHeader('Content-Disposition', `attachment; filename="${baseName}.xlsx"`);
-
-    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res });
-    const sheet = workbook.addWorksheet('data');
-
-    const result = await this.asUser(req).exportRows(input, EXCEL_MAX_DATA_ROWS, {
-      onStart: (headers) => {
-        sheet.addRow(headers).commit();
-      },
-      onRows: (rows) => {
-        for (const row of rows) {
-          sheet.addRow(row.map((v) => (v === null ? '' : v))).commit();
-        }
-      },
-    });
-    void result;
-    await workbook.commit();
+    job.bytes = fs.statSync(job.filePath).size;
+    job.state = 'ready';
   }
 }
 

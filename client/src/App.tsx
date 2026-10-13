@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   AlertDescription,
@@ -36,6 +36,7 @@ import {
   SelectValue,
   Separator,
   Skeleton,
+  Spinner,
   Table,
   TableBody,
   TableCell,
@@ -59,14 +60,17 @@ import { SearchableSelect } from './components/SearchableSelect';
 import {
   api,
   EXCEL_MAX_DATA_ROWS,
-  exportUrl,
+  exportFileUrl,
+  exportStatus,
   OPERATORS,
   operatorNeedsValue,
+  startExport,
   type ExplorerColumn,
   type QueryBody,
 } from './api';
 
 const numberFmt = new Intl.NumberFormat('pt-BR');
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface DraftFilter {
   id: number;
@@ -78,6 +82,12 @@ interface DraftFilter {
 interface CommittedQuery {
   filters: { column: string; operator: string; value?: string }[];
   search: string;
+}
+
+interface ExportState {
+  format: 'csv' | 'xlsx';
+  state: 'building' | 'ready' | 'error';
+  rowCount: number;
 }
 
 let filterSeq = 1;
@@ -110,6 +120,8 @@ export default function App() {
   // export
   const [exportCols, setExportCols] = useState<string[]>([]);
   const [truncateOpen, setTruncateOpen] = useState(false);
+  const [exportJob, setExportJob] = useState<ExportState | null>(null);
+  const exportRunRef = useRef(0);
 
   // ---- loaders ----
   useEffect(() => {
@@ -130,6 +142,8 @@ export default function App() {
     setExportCols([]);
     setCommitted({ filters: [], search: '' });
     setError(null);
+    exportRunRef.current++; // cancel any in-flight export polling
+    setExportJob(null);
   }, []);
 
   const handleSelectCatalog = useCallback(
@@ -250,22 +264,58 @@ export default function App() {
     };
   }, [catalog, schema, table, committed, exportCols]);
 
-  const triggerDownload = useCallback((format: 'csv' | 'xlsx', body: QueryBody) => {
+  const downloadFile = (id: string) => {
     const a = document.createElement('a');
-    a.href = exportUrl(format, body);
+    a.href = exportFileUrl(id);
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     a.remove();
-  }, []);
+  };
+
+  const startDownload = useCallback(
+    async (format: 'csv' | 'xlsx') => {
+      if (!exportBody) return;
+      const runId = ++exportRunRef.current;
+      setError(null);
+      setExportJob({ format, state: 'building', rowCount: 0 });
+      try {
+        const id = await startExport(format, exportBody);
+        for (;;) {
+          await sleep(900);
+          if (exportRunRef.current !== runId) return; // superseded / reset
+          const st = await exportStatus(id);
+          if (exportRunRef.current !== runId) return;
+          setExportJob({ format, state: st.state, rowCount: st.rowCount });
+          if (st.state === 'ready') {
+            downloadFile(id);
+            setTimeout(() => {
+              if (exportRunRef.current === runId) setExportJob(null);
+            }, 2500);
+            return;
+          }
+          if (st.state === 'error') {
+            setError(st.error ?? 'Falha ao gerar o arquivo de exportação.');
+            setExportJob(null);
+            return;
+          }
+        }
+      } catch (e) {
+        if (exportRunRef.current !== runId) return;
+        setError(e instanceof Error ? e.message : 'Falha na exportação');
+        setExportJob(null);
+      }
+    },
+    [exportBody],
+  );
 
   const handleDownload = (format: 'csv' | 'xlsx') => {
-    if (!exportBody) return;
+    if (!exportBody || exportJob?.state === 'building') return;
     if (format === 'xlsx' && rowCount !== null && rowCount > EXCEL_MAX_DATA_ROWS) {
       setTruncateOpen(true);
       return;
     }
-    triggerDownload(format, exportBody);
+    void startDownload(format);
   };
 
   const toggleExportCol = (name: string) =>
@@ -275,6 +325,7 @@ export default function App() {
 
   const hasTable = Boolean(catalog && schema && table);
   const fqn = hasTable ? `${catalog}.${schema}.${table}` : '';
+  const building = exportJob?.state === 'building';
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -526,26 +577,43 @@ export default function App() {
                       size="sm"
                       variant="outline"
                       onClick={() => handleDownload('csv')}
-                      disabled={previewLoading}
+                      disabled={building || previewLoading}
                     >
-                      <Download className="h-4 w-4 mr-1" /> CSV
+                      {building && exportJob?.format === 'csv' ? (
+                        <Spinner className="h-4 w-4 mr-1" />
+                      ) : (
+                        <Download className="h-4 w-4 mr-1" />
+                      )}
+                      CSV
                     </Button>
                     <Button
                       size="sm"
                       onClick={() => handleDownload('xlsx')}
-                      disabled={previewLoading}
+                      disabled={building || previewLoading}
                     >
-                      <FileSpreadsheet className="h-4 w-4 mr-1" /> Excel
+                      {building && exportJob?.format === 'xlsx' ? (
+                        <Spinner className="h-4 w-4 mr-1" />
+                      ) : (
+                        <FileSpreadsheet className="h-4 w-4 mr-1" />
+                      )}
+                      Excel
                     </Button>
                   </div>
                 </div>
+
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {building ? (
+                    <span className="text-foreground">
+                      Preparando arquivo {exportJob?.format.toUpperCase()}…{' '}
+                      {numberFmt.format(exportJob?.rowCount ?? 0)} linhas gravadas
+                    </span>
+                  ) : (
+                    'O arquivo é gerado no servidor e o download pode ser retomado se a conexão cair.'
+                  )}
+                </div>
               </CardHeader>
               <CardContent>
-                <PreviewTable
-                  columns={columns}
-                  rows={rows}
-                  loading={previewLoading}
-                />
+                <PreviewTable columns={columns} rows={rows} loading={previewLoading} />
               </CardContent>
             </Card>
           </>
@@ -567,11 +635,7 @@ export default function App() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancelar</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (exportBody) triggerDownload('xlsx', exportBody);
-              }}
-            >
+            <AlertDialogAction onClick={() => void startDownload('xlsx')}>
               Exportar mesmo assim
             </AlertDialogAction>
           </AlertDialogFooter>
