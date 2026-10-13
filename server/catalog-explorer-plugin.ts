@@ -18,6 +18,24 @@ import {
 class ExternalLinkUnavailable extends Error {}
 
 /**
+ * Best-effort statement cancel. The @databricks/sdk-experimental may not
+ * expose a typed cancelStatement method, so we probe known method names
+ * at runtime. If none is found, the statement is left for server-side
+ * timeout — not ideal, but not a blocker.
+ */
+function tryCancelStatement(exec: unknown, statementId: string): void {
+  const svc = exec as Record<string, unknown>;
+  for (const method of ['cancelExecution', 'cancelStatement', 'cancel']) {
+    if (typeof svc[method] === 'function') {
+      (svc[method] as (arg: { statement_id: string }) => Promise<unknown>)
+        .call(exec, { statement_id: statementId })
+        .catch(() => {});
+      return;
+    }
+  }
+}
+
+/**
  * Process-wide memo: whether EXTERNAL_LINKS result URLs are reachable from this
  * runtime. `null` = unknown, `true` = usable, `false` = blocked (e.g. the
  * builder sandbox is denied by the workspace IP access list) → use INLINE.
@@ -950,6 +968,7 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
+      tryCancelStatement(exec, statementId);
       throw mapScopeError(err);
     }
 
@@ -1072,6 +1091,7 @@ class CatalogExplorerPlugin extends Plugin {
         throw new Error(resp.status?.error?.message || `Query ${state ?? 'failed'}`);
       }
     } catch (err) {
+      tryCancelStatement(exec, statementId);
       throw mapScopeError(err);
     }
 
