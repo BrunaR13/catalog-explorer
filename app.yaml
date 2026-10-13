@@ -1,1 +1,4 @@
 command: ['npm', 'run', 'start']
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "d49008436fbfcd3e"
